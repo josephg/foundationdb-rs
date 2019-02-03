@@ -5,7 +5,7 @@ use std::ops::FnOnce;
 use futures_preview::prelude::*;
 use futures_preview::task::{AtomicWaker, LocalWaker, Poll};
 
-use error::{Error, Result};
+use crate::error::{Error, Result};
 use foundationdb_sys as fdb;
 
 /// An opaque type that represents a Future in the FoundationDB C API.
