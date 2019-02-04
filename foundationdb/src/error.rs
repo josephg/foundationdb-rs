@@ -11,6 +11,7 @@
 use std;
 use std::ffi::CStr;
 use std::fmt::{self, Display};
+use std::num::NonZeroU32; // Using U32 because NonZeroI32 doesn't exist.
 
 use failure::{Backtrace, Context, Fail};
 
@@ -153,10 +154,10 @@ impl Error {
     }
 
     /// Error code
-    pub fn code(&self) -> i32 {
+    pub fn code(&self) -> Option<NonZeroU32> {
         match *self.kind.get_context() {
-            ErrorKind::Fdb { error_code, .. } => error_code,
-            _ => 4000,
+            ErrorKind::Fdb { error_code, .. } => NonZeroU32::new(error_code as u32),
+            _ => None,
         }
     }
 

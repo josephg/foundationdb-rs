@@ -14,13 +14,14 @@ use std;
 use std::sync::Arc;
 
 use foundationdb_sys as fdb;
-use futures::future::*;
-use futures::Future;
+use futures::prelude::*;
+use std::future::Future;
 
 use crate::cluster::*;
 use crate::error::{self, Error as FdbError, Result};
 use crate::options;
 use crate::transaction::*;
+
 
 /// Represents a FoundationDB database — a mutable, lexicographically ordered mapping from binary keys to binary values.
 ///
@@ -65,43 +66,41 @@ impl Database {
     /// It might retry indefinitely if the transaction is highly contentious. It is recommended to
     /// set `TransactionOption::RetryLimit` or `TransactionOption::SetTimeout` on the transaction
     /// if the task need to be guaranteed to finish.
-    pub fn transact<F, Fut, Item, Error>(
-        &self,
-        f: F,
-    ) -> Box<Future<Item = Fut::Item, Error = Error>>
-    where
-        F: FnMut(Transaction) -> Fut + 'static,
-        Fut: IntoFuture<Item = Item, Error = Error> + 'static,
-        Item: 'static,
-        Error: From<FdbError> + 'static,
+    #[must_use]
+    pub fn transact<'a, Item, F, Fut>(
+        &'a self,
+        mut f: F,
+    ) -> impl Future<Output=Result<Item>> + 'a
+        where
+            F: 'a + FnMut(Transaction) -> Fut,
+            Item: 'a,
+            Fut: Future<Output=Result<Item>> + 'a,
     {
-        let db = self.clone();
+        async move {
+            let trx = self.create_trx()?;
 
-        let f = result(db.create_trx())
-            .map_err(Error::from)
-            .and_then(|trx| {
-                loop_fn((trx, f), |(trx, mut f)| {
-                    let trx0 = trx.clone();
-                    f(trx.clone()).into_future().and_then(move |res| {
-                        // try to commit the transaction
-                        trx0.commit().map(|_| res).then(|res| match res {
-                            Ok(v) => {
-                                // committed
-                                Ok(Loop::Break(v))
-                            }
-                            Err(e) => {
-                                if e.should_retry() {
-                                    Ok(Loop::Continue((trx, f)))
-                                } else {
-                                    Err(Error::from(e))
-                                }
-                            }
-                        })
-                    })
-                })
-            });
+            loop {
+                let result = await!(f(trx.clone()).and_then(|item| async {
+                    await!(trx.commit())?;
+                    Ok(item)
+                }));
 
-        Box::new(f)
+                match result {
+                    Ok(v) => { return Ok(v) }
+                    Err(e) => {
+                        match trx.on_error(&e) {
+                            // If the error isn't a FDB error, bail immediately.
+                            // This is a bit nasty, but relatively straightforward.
+                            None => { return Err(e) }
+                            Some(fut) => {
+                                if let Err(e) = await!(fut) { return Err(e) }
+                            }
+                        }
+                        // Otherwise continue.
+                    }
+                }
+            }
+        }
     }
 }
 

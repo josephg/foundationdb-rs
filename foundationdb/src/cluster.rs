@@ -11,8 +11,8 @@
 //! https://apple.github.io/foundationdb/api-c.html#cluster
 
 use foundationdb_sys as fdb;
+use std::future::Future;
 use crate::future::*;
-use futures::{Async, Future};
 use std;
 use std::sync::Arc;
 
@@ -21,9 +21,8 @@ use crate::error::*;
 
 /// An opaque type that represents a Cluster in the FoundationDB C API.
 #[derive(Clone)]
-pub struct Cluster {
-    inner: Arc<ClusterInner>,
-}
+pub struct Cluster(Arc<ClusterInner>);
+
 impl Cluster {
     /// Returns an FdbFuture which will be set to an FDBCluster object.
     ///
@@ -32,13 +31,14 @@ impl Cluster {
     /// * `path` - A string giving a local path of a cluster file (often called ‘fdb.cluster’) which contains connection information for the FoundationDB cluster. See `foundationdb::default_config_path()`
     ///
     /// TODO: implement Default for Cluster where: If cluster_file_path is NULL or an empty string, then a default cluster file will be used. see
-    pub fn new(path: &str) -> ClusterGet {
+    pub fn new(path: &str) -> impl Future<Output=Result<Cluster>> {
         let path_str = std::ffi::CString::new(path).unwrap();
-        let inner = unsafe {
+        unsafe {
             let f = fdb::fdb_create_cluster(path_str.as_ptr());
-            FdbFuture::new(f)
-        };
-        ClusterGet { inner }
+            FdbFuture3::new_mapped(f, |r| {
+                Ok(Cluster(Arc::new(ClusterInner(r.get_cluster()?))))
+            })
+        }
     }
 
     // TODO: fdb_cluster_set_option impl
@@ -46,53 +46,21 @@ impl Cluster {
     /// Returns an `FdbFuture` which will be set to an `Database` object.
     ///
     /// TODO: impl Future
-    pub fn create_database(&self) -> Box<Future<Item = Database, Error = Error>> {
-        let f = unsafe {
-            let f_db = fdb::fdb_cluster_create_database(self.inner.inner, b"DB" as *const _, 2);
+    pub fn create_database(&self) -> impl Future<Output=Result<Database>> {
+        unsafe {
+            let f_db = fdb::fdb_cluster_create_database((self.0).0, b"DB" as *const _, 2);
             let cluster = self.clone();
-            FdbFuture::new(f_db)
-                .and_then(|f| f.get_database())
-                .map(|db| Database::new(cluster, db))
-        };
-        Box::new(f)
-    }
-}
-
-/// A future result of the `Cluster::new`
-pub struct ClusterGet {
-    inner: FdbFuture,
-}
-impl Future for ClusterGet {
-    type Item = Cluster;
-    type Error = Error;
-
-    fn poll(&mut self) -> Result<Async<Self::Item>> {
-        match self.inner.poll() {
-            Ok(Async::Ready(r)) => match unsafe { r.get_cluster() } {
-                Ok(c) => Ok(Async::Ready(Cluster {
-                    inner: Arc::new(ClusterInner::new(c)),
-                })),
-                Err(e) => Err(e),
-            },
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => Err(e),
+            FdbFuture3::new_mapped(f_db, |r| Ok(Database::new(cluster, r.get_database()?)))
         }
     }
 }
 
 //TODO: should check if `fdb::FDBCluster` is thread-safe.
-struct ClusterInner {
-    inner: *mut fdb::FDBCluster,
-}
-impl ClusterInner {
-    fn new(inner: *mut fdb::FDBCluster) -> Self {
-        Self { inner }
-    }
-}
+struct ClusterInner(*mut fdb::FDBCluster);
 impl Drop for ClusterInner {
     fn drop(&mut self) {
         unsafe {
-            fdb::fdb_cluster_destroy(self.inner);
+            fdb::fdb_cluster_destroy(self.0);
         }
     }
 }

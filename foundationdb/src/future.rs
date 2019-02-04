@@ -1,95 +1,135 @@
-// Copyright 2018 foundationdb-rs developers, https://github.com/bluejekyll/foundationdb-rs/graphs/contributors
-// Copyright 2013-2018 Apple, Inc and the FoundationDB project authors.
-//
-// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
-// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
-// http://opensource.org/licenses/MIT>, at your option. This file may not be
-// copied, modified, or distributed except according to those terms.
+use std::pin::Pin;
+use std::ptr::NonNull;
+use std::ops::{FnOnce, Deref};
+use std::fmt::Debug;
 
-//! Most functions in the FoundationDB API are asynchronous, meaning that they may return to the caller before actually delivering their result.
-//!
-//! These functions always return FDBFuture*. An FDBFuture object represents a result value or error to be delivered at some future time. You can wait for a Future to be “ready” – to have a value or error delivered – by setting a callback function, or by blocking a thread, or by polling. Once a Future is ready, you can extract either an error code or a value of the appropriate type (the documentation for the original function will tell you which fdb_future_get_*() function you should call).
-//!
-//! Futures make it easy to do multiple operations in parallel, by calling several asynchronous functions before waiting for any of the results. This can be important for reducing the latency of transactions.
-//!
-//! The Rust API Client has been implemented to use the Rust futures crate, and should work within that ecosystem (suchas Tokio). See Rust [futures](https://docs.rs/crate/futures/0.1.21) documentation.
-
-use std;
-use std::ops::Deref;
-
-use foundationdb_sys as fdb;
-use futures;
-use futures::Async;
+use futures::prelude::*;
+use futures::future::FusedFuture;
+use futures::task::{AtomicWaker, LocalWaker, Poll};
 
 use crate::error::{self, Error, Result};
+use foundationdb_sys as fdb;
+pub use crate::andthenfut::*;
+
+
 
 /// An opaque type that represents a Future in the FoundationDB C API.
-pub(crate) struct FdbFuture {
-    f: Option<*mut fdb::FDBFuture>,
-    task: Option<Box<futures::task::Task>>,
+pub(crate) struct FdbFuture3 {
+    f: Option<NonNull<fdb::FDBFuture>>, // Set to None once the result has been returned
+
+    // We need an AtomicWaker because FDB may resolve the promise in the context of the network thread.
+    waker: AtomicWaker,
 }
 
-impl FdbFuture {
-    // `new` is marked as unsafe because it's lifetime is not well-defined.
-    pub(crate) unsafe fn new(f: *mut fdb::FDBFuture) -> Self {
-        Self {
-            f: Some(f),
-            task: None,
+impl FdbFuture3 {
+    pub(crate) unsafe fn new(fdb_fut: *mut fdb::FDBFuture) -> Self {
+        FdbFuture3 {
+            f: Some(NonNull::new(fdb_fut).expect("future is null")),
+            waker: AtomicWaker::new(),
         }
+    }
+
+    pub(crate) unsafe fn new_mapped<T, F>(fdb_fut: *mut fdb::FDBFuture, f: F) -> impl Future<Output=Result<T>>
+        where F: FnOnce(FdbFutureResult) -> Result<T> {
+        FdbFuture3::new(fdb_fut).and_map(f)
+    }
+
+    pub(crate) unsafe fn new_void(fdb_fut: *mut fdb::FDBFuture) -> impl Future<Output=Result<()>> {
+        FdbFuture3::new(fdb_fut).map_ok(|_r| ())
     }
 }
 
-impl Drop for FdbFuture {
+impl Drop for FdbFuture3 {
     fn drop(&mut self) {
-        if let Some(f) = self.f.take() {
-            // `fdb_future_destory` cancels the future, so we don't need to call
-            // `fdb_future_cancel` explicitly.
-            unsafe { fdb::fdb_future_destroy(f) }
+        if let Some(f) = self.f {
+            unsafe { fdb::fdb_future_destroy(f.as_ptr()) }
         }
     }
 }
 
-impl futures::Future for FdbFuture {
-    type Item = FdbFutureResult;
+impl FusedFuture for FdbFuture3 {
+    fn is_terminated(&self) -> bool { self.f.is_some() }
+}
+
+impl TryFuture for FdbFuture3 {
+    type Ok = FdbFutureResult;
     type Error = Error;
 
-    fn poll(&mut self) -> std::result::Result<Async<Self::Item>, Self::Error> {
+    fn try_poll(self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Result<Self::Ok>> {
         let f = self.f.expect("cannot poll after resolve");
+        let f_ptr = f.as_ptr();
 
-        if self.task.is_none() {
-            let task = futures::task::current();
-            let task = Box::new(task);
-            let task_ptr = task.as_ref() as *const _;
+        if unsafe {fdb::fdb_future_is_ready(f_ptr)} == 0 {
+            self.waker.register(lw);
             unsafe {
-                fdb::fdb_future_set_callback(f, Some(fdb_future_callback), task_ptr as *mut _);
-            }
-            self.task = Some(task);
-
-            return Ok(Async::NotReady);
+                let waker: *mut _ = &mut self.get_unchecked_mut().waker;
+                fdb::fdb_future_set_callback(f_ptr, Some(fdb_future_callback), waker as *mut _);
+            };
+            return Poll::Pending;
         }
 
-        let ready = unsafe { fdb::fdb_future_is_ready(f) };
-        if ready == 0 {
-            return Ok(Async::NotReady);
-        }
+        // Alright; the promise *is* ready. Resolve.
+        self.get_mut().f = None;
 
-        unsafe { error::eval(fdb::fdb_future_get_error(f))? };
-
-        // The result is taking ownership of fdb::FDBFuture
-        let g = FdbFutureResult::new(self.f.take().unwrap());
-        Ok(Async::Ready(g))
+        let err_code = unsafe { fdb::fdb_future_get_error(f_ptr) };
+        if err_code != 0 { Poll::Ready(Err(Error::from(err_code))) }
+        else { Poll::Ready(Ok(FdbFutureResult(f))) }
     }
 }
 
-// The callback from fdb C API can be called from multiple threads. so this callback should be
-// thread-safe.
 extern "C" fn fdb_future_callback(
     _f: *mut fdb::FDBFuture,
     callback_parameter: *mut ::std::os::raw::c_void,
 ) {
-    let task: *const futures::task::Task = callback_parameter as *const _;
-    let task: &futures::task::Task = unsafe { &*task };
-    task.notify();
+    let waker: *mut AtomicWaker = callback_parameter as *mut _;
+    unsafe { &*waker }.wake();
+}
+
+
+/// A wrapped future which is guaranteed to be:
+///
+/// - Ready
+/// - Not in an error state
+/// - Valid (ie, not yet destroyed)
+pub(crate) struct FdbFutureResult(NonNull<fdb::FDBFuture>);
+
+impl Drop for FdbFutureResult {
+    fn drop(&mut self) {
+        unsafe { fdb::fdb_future_destroy(self.0.as_ptr()) }
+    }
+}
+
+/// For output which is owned by the future (eg strings), we could either copy it into a Box or something, or keep it allocated alongside the future reference. Done this way avoids an allocation.
+pub struct FutCell<'a, T: 'a> {
+    _fut: FdbFutureResult,
+    inner_value: T, // Actual lifetime attached to the FDB future lifetime.
+    _dummy: std::marker::PhantomData<&'a T>
+}
+
+impl<'a, T> Deref for FutCell<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner_value
+    }
+}
+
+//impl<T> Deref for ScopedResult<&T> {
+//    type Target = T;
+//    fn deref(&self) -> &T {
+//        self.inner_value
+//    }
+//}
+
+impl<T: Clone> FutCell<'_, T> {
+    pub fn into_owned(&self) -> T {
+        self.inner_value.clone()
+    }
+}
+
+impl<T: Debug> Debug for FutCell<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ScopedResult ({:?})", self.inner_value)
+    }
 }
 
 /// Represents the output of fdb_future_get_keyvalue_array().
@@ -114,6 +154,7 @@ impl<'a> Deref for KeyValues<'a> {
     }
 }
 
+
 /// Represents a single key-value pair in the output of fdb_future_get_keyvalue_array().
 // Uses repr(packed) because c API uses 4-byte alignment for this struct
 // TODO: field reordering might change a struct layout...
@@ -136,62 +177,35 @@ impl<'a> KeyValue<'a> {
     }
 }
 
-/// The Result of an FdbFuture from which query results can be gottent, etc.
-pub(crate) struct FdbFutureResult {
-    f: *mut fdb::FDBFuture,
-}
-
-impl Drop for FdbFutureResult {
-    fn drop(&mut self) {
-        unsafe { fdb::fdb_future_destroy(self.f) }
-    }
-}
-
 impl FdbFutureResult {
-    pub(crate) fn new(f: *mut fdb::FDBFuture) -> Self {
-        Self { f }
+    fn into_scoped<'a, T: 'a>(self, value: T) -> FutCell<'a, T> {
+        FutCell {
+            _fut: self,
+            inner_value: value,
+            _dummy: std::marker::PhantomData,
+        }
     }
 
     pub(crate) unsafe fn get_cluster(&self) -> Result<*mut fdb::FDBCluster> {
         let mut v: *mut fdb::FDBCluster = std::ptr::null_mut();
-        error::eval(fdb::fdb_future_get_cluster(self.f, &mut v as *mut _))?;
+        error::eval(fdb::fdb_future_get_cluster(self.0.as_ptr(), &mut v as *mut _))?;
         Ok(v)
     }
 
     pub(crate) unsafe fn get_database(&self) -> Result<*mut fdb::FDBDatabase> {
         let mut v: *mut fdb::FDBDatabase = std::ptr::null_mut();
-        error::eval(fdb::fdb_future_get_database(self.f, &mut v as *mut _))?;
+        error::eval(fdb::fdb_future_get_database(self.0.as_ptr(), &mut v as *mut _))?;
         Ok(v)
     }
 
-    #[allow(unused)]
-    pub(crate) fn get_key<'a>(&'a self) -> Result<&'a [u8]> {
-        let mut out_value = std::ptr::null();
-        let mut out_len = 0;
-
-        unsafe {
-            error::eval(fdb::fdb_future_get_key(
-                self.f,
-                &mut out_value as *mut _,
-                &mut out_len as *mut _,
-            ))?
-        }
-
-        // A value from `fdb_future_get_value` will alive until `fdb_future_destroy` is called and
-        // `fdb_future_destroy` is called on `Self::drop`, so a lifetime of the value matches with
-        // `self`
-        let slice = unsafe { std::slice::from_raw_parts(out_value, out_len as usize) };
-        Ok(slice)
-    }
-
-    pub(crate) fn get_value<'a>(&'a self) -> Result<Option<&'a [u8]>> {
+    pub(crate) fn get_value<'a>(self) -> Result<Option<FutCell<'a, &'a [u8]>>> {
         let mut present = 0;
         let mut out_value = std::ptr::null();
         let mut out_len = 0;
 
         unsafe {
             error::eval(fdb::fdb_future_get_value(
-                self.f,
+                self.0.as_ptr(),
                 &mut present as *mut _,
                 &mut out_value as *mut _,
                 &mut out_len as *mut _,
@@ -206,10 +220,30 @@ impl FdbFutureResult {
         // `fdb_future_destroy` is called on `Self::drop`, so a lifetime of the value matches with
         // `self`
         let slice = unsafe { std::slice::from_raw_parts(out_value, out_len as usize) };
-        Ok(Some(slice))
+        Ok(Some(self.into_scoped(slice)))
     }
 
-    pub(crate) fn get_string_array(&self) -> Result<Vec<&[u8]>> {
+//    #[allow(unused)]
+    pub(crate) fn get_key<'a>(self) -> Result<FutCell<'a, &'a [u8]>> {
+        let mut out_value = std::ptr::null();
+        let mut out_len = 0;
+
+        unsafe {
+            error::eval(fdb::fdb_future_get_key(
+                self.0.as_ptr(),
+                &mut out_value as *mut _,
+                &mut out_len as *mut _,
+            ))?
+        }
+
+        // A value from `fdb_future_get_value` will alive until `fdb_future_destroy` is called and
+        // `fdb_future_destroy` is called on `Self::drop`, so a lifetime of the value matches with
+        // `self`
+        let slice = unsafe { std::slice::from_raw_parts(out_value, out_len as usize) };
+        Ok(self.into_scoped(slice))
+    }
+
+    pub(crate) fn get_string_array<'a>(self) -> Result<FutCell<'a, Vec<&'a [u8]>>> {
         use std::os::raw::c_char;
 
         let mut out_strings: *mut *const c_char = std::ptr::null_mut();
@@ -217,7 +251,7 @@ impl FdbFutureResult {
 
         unsafe {
             error::eval(fdb::fdb_future_get_string_array(
-                self.f,
+                self.0.as_ptr(),
                 &mut out_strings as *mut _,
                 &mut out_len as *mut _,
             ))?
@@ -232,17 +266,17 @@ impl FdbFutureResult {
             let cstr = unsafe { std::ffi::CStr::from_ptr(out_strings[i]) };
             v.push(cstr.to_bytes());
         }
-        Ok(v)
+        Ok(self.into_scoped(v))
     }
 
-    pub(crate) fn get_keyvalue_array<'a>(&'a self) -> Result<KeyValues<'a>> {
+    pub(crate) fn get_keyvalue_array<'a>(self) -> Result<FutCell<'a, KeyValues<'a>>> {
         let mut out_keyvalues = std::ptr::null();
         let mut out_len = 0;
         let mut more = 0;
 
         unsafe {
             error::eval(fdb::fdb_future_get_keyvalue_array(
-                self.f,
+                self.0.as_ptr(),
                 &mut out_keyvalues as *mut _,
                 &mut out_len as *mut _,
                 &mut more as *mut _,
@@ -253,25 +287,17 @@ impl FdbFutureResult {
         let out_keyvalues: &[fdb::keyvalue] =
             unsafe { std::slice::from_raw_parts(out_keyvalues, out_len) };
         let out_keyvalues: &[KeyValue] = unsafe { std::mem::transmute(out_keyvalues) };
-        Ok(KeyValues {
+        Ok(self.into_scoped(KeyValues {
             keyvalues: out_keyvalues,
             more: (more != 0),
-        })
+        }))
     }
 
     pub(crate) fn get_version(&self) -> Result<i64> {
         let mut version: i64 = 0;
         unsafe {
-            error::eval(fdb::fdb_future_get_version(self.f, &mut version as *mut _))?;
+            error::eval(fdb::fdb_future_get_version(self.0.as_ptr(), &mut version as *mut _))?;
         }
         Ok(version)
-    }
-}
-
-#[allow(unused)]
-fn test_keyvalue_size() {
-    unsafe {
-        // compile-time test for struct size
-        std::mem::transmute::<KeyValue, fdb::keyvalue>(std::mem::uninitialized());
     }
 }

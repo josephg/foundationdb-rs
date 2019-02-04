@@ -109,7 +109,7 @@
 //! *WARNING* Until the 1.0 release of this library, the API may be in constant flux.
 
 //#![deny(missing_docs)]
-#![feature(futures_api)]
+#![feature(futures_api, async_await, await_macro)]
 
 #[macro_use]
 extern crate failure;
@@ -117,19 +117,19 @@ extern crate failure;
 extern crate failure_derive;
 extern crate byteorder;
 extern crate foundationdb_sys;
-#[macro_use]
-extern crate futures;
+//#[macro_use]
+//extern crate futures;
 #[cfg(feature = "uuid")]
 extern crate uuid;
 
-extern crate futures_preview;
+extern crate futures;
 
 pub mod cluster;
 pub mod database;
 pub mod error;
 pub mod fdb_api;
+mod andthenfut;
 pub mod future;
-pub mod futures3;
 pub mod keyselector;
 pub mod network;
 /// Generated configuration types for use with the various `set_option` functions
