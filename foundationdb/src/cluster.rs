@@ -11,7 +11,6 @@
 //! https://apple.github.io/foundationdb/api-c.html#cluster
 
 use foundationdb_sys as fdb;
-use std::future::Future;
 use crate::future::*;
 use std;
 use std::sync::Arc;
@@ -35,7 +34,7 @@ impl Cluster {
         let path_str = std::ffi::CString::new(path).unwrap();
         unsafe {
             let f = fdb::fdb_create_cluster(path_str.as_ptr());
-            FdbFuture3::new_mapped(f, |r| {
+            FdbFuture::new_mapped(f, |r| {
                 Ok(Cluster(Arc::new(ClusterInner(r.get_cluster()?))))
             })
         }
@@ -50,7 +49,7 @@ impl Cluster {
         unsafe {
             let f_db = fdb::fdb_cluster_create_database((self.0).0, b"DB" as *const _, 2);
             let cluster = self.clone();
-            FdbFuture3::new_mapped(f_db, |r| Ok(Database::new(cluster, r.get_database()?)))
+            FdbFuture::new_mapped(f_db, |r| Ok(Database::new(cluster, r.get_database()?)))
         }
     }
 }

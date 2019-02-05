@@ -15,8 +15,6 @@ use foundationdb_sys as fdb;
 use std;
 use std::sync::Arc;
 
-use futures::prelude::*;
-
 use crate::database::*;
 use crate::error::{self, *};
 use crate::future::*;
@@ -220,7 +218,7 @@ impl Transaction {
                 key.len() as i32,
                 fdb_bool(snapshot),
             );
-            FdbFuture3::new_mapped(f, |r| r.get_value::<'a>())
+            FdbFuture::new_mapped(f, |r| r.get_value::<'a>())
         }
     }
 
@@ -263,7 +261,7 @@ impl Transaction {
     /// selector. You must first wait for the FDBFuture to be ready, check for errors, call
     /// fdb_future_get_key() to extract the key, and then destroy the FDBFuture with
     /// fdb_future_destroy().
-    pub fn get_key<'a>(&self, selector: KeySelector, snapshot: bool) -> impl Future<Output=Result<FutCell<'a, &'a [u8]>>> {
+    pub fn get_key<'a>(&self, selector: KeySelector, snapshot: bool) -> impl WaitFuture<Result<FutCell<'a, &'a [u8]>>> {
         let trx = self.inner.inner;
 
         let key = selector.key();
@@ -277,7 +275,7 @@ impl Transaction {
                 selector.offset() as i32,
                 fdb_bool(snapshot),
             );
-            FdbFuture3::new_mapped(f, |r| r.get_key())
+            FdbFuture::new_mapped(f, |r| r.get_key())
         }
     }
 
@@ -386,7 +384,7 @@ impl Transaction {
     /// Returns an FDBFuture which will be set to an array of strings. You must first wait for the
     /// FDBFuture to be ready, check for errors, call fdb_future_get_string_array() to extract the
     /// string array, and then destroy the FDBFuture with fdb_future_destroy().
-    pub fn get_addresses_for_key<'a>(&self, key: &[u8]) -> impl Future<Output=Result<FutCell<'a, Vec<&'a [u8]>>>> {
+    pub fn get_addresses_for_key<'a>(&self, key: &[u8]) -> impl WaitFuture<Result<FutCell<'a, Vec<&'a [u8]>>>> {
         let trx = self.inner.inner;
 
         unsafe {
@@ -395,7 +393,7 @@ impl Transaction {
                 key.as_ptr() as *const _,
                 key.len() as i32,
             );
-            FdbFuture3::new_mapped(f, |r| r.get_string_array())
+            FdbFuture::new_mapped(f, |r| r.get_string_array())
         }
     }
 
@@ -447,12 +445,12 @@ impl Transaction {
     /// optimized to a read-only transaction.
     ///
     /// Most applications will not call this function.
-    pub fn get_versionstamp<'a>(&self) -> impl Future<Output=Result<FutCell<'a, &'a [u8]>>> {
+    pub fn get_versionstamp<'a>(&self) -> impl WaitFuture<Result<FutCell<'a, &'a [u8]>>> {
         let trx = self.inner.inner;
 
         unsafe {
             let f = fdb::fdb_transaction_get_versionstamp(trx);
-            FdbFuture3::new_mapped(f, |r| r.get_key())
+            FdbFuture::new_mapped(f, |r| r.get_key())
         }
     }
 
@@ -460,12 +458,12 @@ impl Transaction {
     /// to fdb_transaction_get_*() (including this one) and (unless causal consistency has been
     /// deliberately compromised by transaction options) is guaranteed to represent all
     /// transactions which were reported committed before that call.
-    pub fn get_read_version(&self) -> impl Future<Output=Result<i64>> {
+    pub fn get_read_version(&self) -> impl WaitFuture<Result<i64>> {
         let trx = self.inner.inner;
 
         unsafe {
             let f = fdb::fdb_transaction_get_read_version(trx);
-            FdbFuture3::new_mapped(f, |r| r.get_version())
+            FdbFuture::new_mapped(f, |r| r.get_version())
         }
     }
 
@@ -519,12 +517,12 @@ impl Transaction {
     /// As with other client/server databases, in some failure scenarios a client may be unable to determine whether a transaction succeeded. In these cases, `Transaction::commit` will return a commit_unknown_result error. The fdb_transaction_on_error() function treats this error as retryable, so retry loops that don’t check for commit_unknown_result could execute the transaction twice. In these cases, you must consider the idempotence of the transaction. For more information, see Transactions with unknown results.
     ///
     /// Normally, commit will wait for outstanding reads to return. However, if those reads were snapshot reads or the transaction option for disabling “read-your-writes” has been invoked, any outstanding reads will immediately return errors.
-    pub fn commit(&self) -> impl Future<Output=Result<()>> + Wait<Result<()>> {
+    pub fn commit(&self) -> impl WaitFuture<Result<()>> {
         let trx = self.inner.inner;
 
         unsafe {
             let f = fdb::fdb_transaction_commit(trx);
-            FdbFuture3::new_void(f)
+            FdbFuture::new_void(f)
         }
     }
 
@@ -575,11 +573,11 @@ impl Transaction {
     /// The API is exposed mainly for `bindingtester`, and it is not recommended to call the API
     /// directly from application. Use `Database::transact` instead.
     #[doc(hidden)]
-    pub fn on_error(&self, error: &Error) -> Option<impl Future<Output=Result<()>>> {
+    pub fn on_error(&self, error: &Error) -> Option<impl WaitFuture<Result<()>>> {
         if let Some(code) = error.code() {
             unsafe {
                 let f = fdb::fdb_transaction_on_error(self.inner.inner, code.get() as i32);
-                Some(FdbFuture3::new_void(f))
+                Some(FdbFuture::new_void(f))
             }
         } else { None }
     }

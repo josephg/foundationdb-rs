@@ -8,9 +8,10 @@ use futures::future::FusedFuture;
 use futures::task::{AtomicWaker, LocalWaker, Poll};
 
 pub use crate::andthenfut::*;
-use crate::error::{self, Error, Result};
+use crate::error::{self, Result};
 use foundationdb_sys as fdb;
 
+// This just exists as a shorthand.
 pub trait WaitFuture<T> = Future<Output=T> + Wait<T>;
 
 /// A semi-safe wrapper for a foundationdb future object which is guaranteed to be valid (not destroyed).
@@ -43,7 +44,7 @@ pub(crate) struct FdbFutureResult(FdbFutureInternal);
 fn result_ok(_result: FdbFutureResult) -> Result<()> { Ok(()) }
 
 /// An opaque type that represents a Future in the FoundationDB C API.
-pub(crate) struct FdbFuture3 {
+pub(crate) struct FdbFuture {
     f: Option<FdbFutureInternal>, // Set to None once the result has been returned
 
     // We need an AtomicWaker because FDB may resolve the promise in the context of the network thread.
@@ -51,9 +52,9 @@ pub(crate) struct FdbFuture3 {
 }
 
 
-impl FdbFuture3 {
+impl FdbFuture {
     pub(crate) unsafe fn new(fdb_fut: *mut fdb::FDBFuture) -> Self {
-        FdbFuture3 {
+        FdbFuture {
             f: Some(FdbFutureInternal::new(fdb_fut)),
             waker: AtomicWaker::new(),
         }
@@ -61,15 +62,15 @@ impl FdbFuture3 {
 
     pub(crate) unsafe fn new_mapped<F, R>(fdb_fut: *mut fdb::FDBFuture, f: F) -> impl Future<Output=Result<R>> + Wait<Result<R>>
             where F: FnOnce(FdbFutureResult) -> Result<R> {
-        FdbFuture3::new(fdb_fut).and_map(f)
+        FdbFuture::new(fdb_fut).and_map(f)
     }
 
     pub(crate) unsafe fn new_void(fdb_fut: *mut fdb::FDBFuture) -> impl Future<Output=Result<()>> + Wait<Result<()>> {
-        FdbFuture3::new_mapped(fdb_fut, result_ok)
+        FdbFuture::new_mapped(fdb_fut, result_ok)
     }
 }
 
-impl Wait<Result<FdbFutureResult>> for FdbFuture3 {
+impl Wait<Result<FdbFutureResult>> for FdbFuture {
     fn wait(mut self) -> Result<FdbFutureResult> {
         let f = self.f.take().expect("Cannot wait on polled FDB future");
         error::eval(unsafe { fdb::fdb_future_block_until_ready(f.as_mut_ptr()) })?;
@@ -77,11 +78,11 @@ impl Wait<Result<FdbFutureResult>> for FdbFuture3 {
     }
 }
 
-impl FusedFuture for FdbFuture3 {
+impl FusedFuture for FdbFuture {
     fn is_terminated(&self) -> bool { self.f.is_some() }
 }
 
-impl Future for FdbFuture3 {
+impl Future for FdbFuture {
     type Output = Result<FdbFutureResult>;
 
     fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Self::Output> {

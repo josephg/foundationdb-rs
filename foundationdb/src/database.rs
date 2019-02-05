@@ -72,7 +72,7 @@ impl Database {
         mut f: F,
     ) -> impl Future<Output=Result<Item>> + 'a
         where
-            F: 'a + FnMut(Transaction) -> Fut,
+            F: 'a + Fn(Transaction) -> Fut,
             Item: 'a,
             Fut: Future<Output=Result<Item>> + 'a,
     {

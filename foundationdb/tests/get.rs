@@ -12,20 +12,23 @@ extern crate foundationdb;
 #[macro_use]
 extern crate lazy_static;
 
-use std::future::*;
 use foundationdb::future::Wait;
 
 use foundationdb::*;
-use futures::*;
 use futures::executor::*;
 
 mod common;
 
+fn setup() -> Database {
+    common::setup_static();
+    let cluster = Cluster::new(foundationdb::default_config_path()).wait().unwrap();
+    let db = cluster.create_database().wait().unwrap();
+    db
+}
+
 #[test]
 fn test_set_get() -> Result<(), Error> {
-    common::setup_static();
-    let cluster = Cluster::new(foundationdb::default_config_path()).wait()?;
-    let db = cluster.create_database().wait()?;
+    let db = setup();
 
     block_on(async || -> Result<(), Error> {
 
@@ -56,9 +59,7 @@ fn test_set_get() -> Result<(), Error> {
 
 #[test]
 fn test_get_multi() -> Result<(), Error> {
-    common::setup_static();
-    let cluster = Cluster::new(foundationdb::default_config_path()).wait()?;
-    let db = cluster.create_database().wait()?;
+    let db = setup();
 
     block_on(async || -> Result<(), Error> {
 //        await!(db.transact(async move |tr| {
@@ -81,180 +82,139 @@ fn test_get_multi() -> Result<(), Error> {
 
 #[test]
 fn test_set_conflict() -> Result<(), Error> {
-    common::setup_static();
-    let cluster = Cluster::new(foundationdb::default_config_path()).wait()?;
-    let db = cluster.create_database().wait()?;
-
+    let db = setup();
     let key = b"test-conflict";
 
     block_on(async || -> Result<(), Error> {
-        let trx2 = db.create_trx()?;
-        await!(trx2.get(key, false))?;
+        let trx1 = db.create_trx()?;
+        await!(trx1.get(key, false))?;
 
-        // Commit concurrent transaction to create conflict.
-        await!(db.transact(async move |trx1| {
-            trx1.set(key, common::random_str(10).as_bytes());
+        // Commit concurrent transaction to create a conflict.
+        await!(db.transact(async move |trx2| {
+            trx2.set(key, common::random_str(10).as_bytes());
             Ok(())
         }))?;
 
-        trx2.set(key, common::random_str(10).as_bytes());
-        let r = await!(trx2.commit());
+        trx1.set(key, common::random_str(10).as_bytes());
+        let r = await!(trx1.commit());
 
 //        println!("{:?}", r);
-        // 1020 == "Transaction not committed due to conflict with another transaction"
+        // 1020: "Transaction not committed due to conflict with another transaction"
         assert_eq!(r.err().expect("Transaction should have conflicted").code().unwrap().get(), 1020);
         Ok(())
     }())
 }
 
-//
-//#[test]
-//fn test_set_conflict_snapshot() {
-//    common::setup_static();
-//
-//    let key = b"test-conflict-snapshot";
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| {
-//            // First transaction. It will be committed before second one.
-//            let fut_set1 = result(db.create_trx()).and_then(|trx1| {
-//                trx1.set(key, common::random_str(10).as_bytes());
-//                trx1.commit()
-//            });
-//
-//            // Second transaction.
-//            result(db.create_trx())
-//                .and_then(|trx2| {
-//                    // snapshot read does not set conflict range, so both transaction will be
-//                    // committed.
-//                    trx2.get(key, true)
-//                })
-//                .and_then(move |val| {
-//                    // commit first transaction
-//                    fut_set1.map(move |_trx1| val.transaction())
-//                })
-//                .and_then(|trx2| {
-//                    // commit seconds transaction, which will *not* cause conflict because of
-//                    // snapshot read
-//                    trx2.set(key, common::random_str(10).as_bytes());
-//                    trx2.commit()
-//                })
-//                .map(|_v| ())
-//        });
-//
-//    fut.wait().expect("failed to run")
-//}
-//
-//// Makes the key dirty. It will abort transactions which performs non-snapshot read on the `key`.
-//fn make_dirty(db: &Database, key: &[u8]) {
-//    let trx = db.create_trx().unwrap();
-//    trx.set(key, b"");
-//    trx.commit().wait().unwrap();
-//}
-//
-//#[test]
-//fn test_transact() {
-//    use std::sync::{atomic::*, Arc};
-//
-//    const KEY: &[u8] = b"test-transact";
-//    const RETRY_COUNT: usize = 5;
-//    common::setup_static();
-//
-//    let try_count = Arc::new(AtomicUsize::new(0));
-//    let try_count0 = try_count.clone();
-//
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| {
-//            // start tranasction with retry
-//            db.transact(move |trx| {
-//                // increment try counter
-//                try_count0.fetch_add(1, Ordering::SeqCst);
-//
-//                trx.set_option(options::TransactionOption::RetryLimit(RETRY_COUNT as u32))
-//                    .expect("failed to set retry limit");
-//
-//                let db = trx.database();
-//
-//                // update conflict range
-//                trx.get(KEY, false).and_then(move |res| {
-//                    // make current transaction invalid by making conflict
-//                    make_dirty(&db, KEY);
-//
-//                    let trx = res.transaction();
-//                    trx.set(KEY, common::random_str(10).as_bytes());
-//                    // `Database::transact` will handle commit by itself, so returns without commit
-//                    Ok(())
-//                })
-//            }).then(|res| match res {
-//                Ok(_) => panic!("should not be able to commit"),
-//                Err(e) => {
-//                    eprintln!("failed as expected: {:?}", e);
-//                    Ok(())
-//                }
-//            })
-//        });
-//
-//    fut.wait().expect("failed to run");
-//    // `TransactionOption::RetryCount` does not count first try, so `try_count` should be equal to
-//    // `RETRY_COUNT+1`
-//    assert_eq!(try_count.load(Ordering::SeqCst), RETRY_COUNT + 1);
-//}
-//
-//#[test]
-//fn test_versionstamp() {
-//    const KEY: &[u8] = b"test-versionstamp";
-//    common::setup_static();
-//
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| result(db.create_trx()))
-//        .and_then(|trx| {
-//            trx.set(KEY, common::random_str(10).as_bytes());
-//            let f_version = trx.get_versionstamp();
-//            trx.commit().and_then(move |_trx| f_version)
-//        })
-//        .map(|r| {
-//            eprintln!("versionstamp: {:?}", r.versionstamp());
-//        });
-//
-//    fut.wait().expect("failed to run");
-//}
-//
-//#[test]
-//fn test_read_version() {
-//    common::setup_static();
-//
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| result(db.create_trx()))
-//        .and_then(|trx| trx.get_read_version())
-//        .map(|v| {
-//            eprintln!("read version: {:?}", v);
-//        });
-//
-//    fut.wait().expect("failed to run");
-//}
-//
-//#[test]
-//fn test_set_read_version() {
-//    const KEY: &[u8] = b"test-versionstamp";
-//    common::setup_static();
-//
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| result(db.create_trx()))
-//        .and_then(|trx| {
-//            trx.set_read_version(0);
-//            trx.get(KEY, false)
-//        })
-//        .map(|_v| {
-//            panic!("should fail with past_version");
-//        })
-//        .or_else(|e| {
-//            eprintln!("failed as expeced: {:?}", e);
-//            Ok::<(), ()>(())
-//        });
-//
-//    fut.wait().expect("failed to run");
-//}
+
+#[test]
+fn test_set_conflict_snapshot() -> Result<(), Error> {
+    let db = setup();
+    let key = b"test-conflict-snapshot";
+
+    block_on(async || -> Result<(), Error> {
+        let trx1 = db.create_trx()?;
+        await!(trx1.get(key, true))?;
+
+        // Commit concurrent transaction to create a conflict.
+        await!(db.transact(async move |trx2| {
+            trx2.set(key, common::random_str(10).as_bytes());
+            Ok(())
+        }))?;
+
+        trx1.set(key, common::random_str(10).as_bytes());
+        await!(trx1.commit()) // Should succeed this time.
+    }())
+}
+
+// Makes the key dirty. It will abort transactions which performs non-snapshot read on the `key`.
+async fn make_dirty<'a>(db: &'a Database, key: &'a [u8]) {
+    await!(db.transact(async move |trx| {
+        trx.set(key, b"");
+        Ok(())
+    })).unwrap();
+}
+
+#[test]
+fn test_transact() -> Result<(), Error> {
+    use std::sync::{atomic::*, Arc};
+
+    const KEY: &[u8] = b"test-transact";
+    const RETRY_COUNT: usize = 5;
+
+    let try_count = Arc::new(AtomicUsize::new(0));
+    let try_count_ref = &try_count; // Needed because we have to `async move`.
+
+    let db = setup();
+    let db_ref = &db;
+
+    block_on(async || -> Result<(), Error> {
+        let result = await!(db.transact(async move |trx| {
+            // increment try counter
+            try_count_ref.fetch_add(1, Ordering::SeqCst);
+
+            trx.set_option(options::TransactionOption::RetryLimit(RETRY_COUNT as u32))
+                .expect("failed to set retry limit");
+
+            // update conflict range
+            await!(trx.get(KEY, false))?;
+
+            // make current transaction invalid by making conflict
+            await!(make_dirty(db_ref, KEY));
+
+            trx.set(KEY, common::random_str(10).as_bytes());
+            // `Database::transact` will handle commit by itself, so returns without commit
+            Ok(())
+        }));
+
+        result.err().expect("should not be able to commit");
+        Ok(())
+    }())
+}
+
+#[test]
+fn test_versionstamp() -> Result<(), Error> {
+    const KEY: &[u8] = b"test-versionstamp";
+    let db = setup();
+
+    let vs = block_on(async || -> Result<_, Error> {
+        // Note whats happening here - the transaction must be committed before we can pull the versionstamp future out and wait on it.
+        let vs_fut = await!(db.transact(async move |trx| {
+            trx.set(KEY, common::random_str(10).as_bytes());
+            Ok(trx.get_versionstamp())
+        }))?;
+
+        await!(vs_fut)
+    }())?;
+
+    println!("versionstamp: {:?}", *vs);
+    Ok(())
+}
+
+#[test]
+fn test_read_version() -> Result<(), Error> {
+    let db = setup();
+
+    block_on(async || -> Result<_, Error> {
+        let trx = db.create_trx()?;
+        let read_version = await!(trx.get_read_version())?;
+
+        println!("read version: {:?}", read_version);
+        Ok(())
+    }())
+}
+
+#[test]
+fn test_set_read_version() {
+    const KEY: &[u8] = b"test-versionstamp";
+    let db = setup();
+
+    let result = block_on(async || -> Result<_, Error> {
+        let trx = db.create_trx()?;
+        trx.set_read_version(1000);
+        await!(trx.get(KEY, false))
+    }());
+
+    assert_eq!(
+        result.err().expect("Should fail with transaction_too_old").code().unwrap().get(),
+        1007);
+}
