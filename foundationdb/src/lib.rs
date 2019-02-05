@@ -75,9 +75,8 @@
 //! network.wait();
 //!
 //! // work with Fdb
-//! let db = Cluster::new(foundationdb::default_config_path())
-//!     .and_then(|cluster| cluster.create_database())
-//!     .wait().expect("failed to create Cluster");
+//! let cluster = Cluster::new(foundationdb::default_config_path()).wait().unwrap();
+//! let db = cluster.create_database().wait().unwrap();
 //!
 //! // set a value
 //! let trx = db.create_trx().expect("failed to create transaction");
@@ -91,7 +90,7 @@
 //! let trx = db.create_trx().expect("failed to create transaction");
 //! let result = trx.get(b"hello", false).wait().expect("failed to read world from hello");
 //!
-//! let value: &[u8] = result.value()
+//! let value: &[u8] = *result
 //!     .unwrap();   // unwrap the option
 //!
 //! // should print "hello world"
@@ -109,7 +108,7 @@
 //! *WARNING* Until the 1.0 release of this library, the API may be in constant flux.
 
 //#![deny(missing_docs)]
-#![feature(futures_api, async_await, await_macro)]
+#![feature(futures_api, async_await, await_macro, trait_alias)]
 
 #[macro_use]
 extern crate failure;
@@ -145,6 +144,7 @@ pub use crate::database::Database;
 pub use crate::error::Error;
 pub use crate::subspace::Subspace;
 pub use crate::transaction::Transaction;
+pub use crate::future::Wait;
 
 /// Initialize the FoundationDB Client API, this can only be called once per process.
 ///

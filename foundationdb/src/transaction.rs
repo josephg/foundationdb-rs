@@ -38,8 +38,7 @@ use crate::tuple::Encode;
 pub struct Transaction {
     // Order of fields should not be changed, because Rust drops field top-to-bottom, and
     // transaction should be dropped before cluster.
-    inner: Arc<TransactionInner>,
-    database: Database,
+    inner: Arc<TransactionInner>
 }
 
 /// Converts Rust `bool` into `fdb::fdb_bool_t`
@@ -157,23 +156,14 @@ impl RangeOptionBuilder {
 
 // TODO: many implementations left
 impl Transaction {
-    pub(crate) fn new(database: Database, trx: *mut fdb::FDBTransaction) -> Self {
+    pub(crate) fn new(trx: *mut fdb::FDBTransaction) -> Self {
         let inner = Arc::new(TransactionInner::new(trx));
-        Self { database, inner }
+        Self { inner }
     }
 
     /// Called to set an option on an FDBTransaction.
     pub fn set_option(&self, opt: options::TransactionOption) -> Result<()> {
         unsafe { opt.apply(self.inner.inner) }
-    }
-
-    /// Returns a clone of this transactions Database
-    pub fn database(&self) -> Database {
-        self.database.clone()
-    }
-
-    fn into_database(self) -> Database {
-        self.database
     }
 
     /// Modify the database snapshot represented by transaction to change the given key to have the given value.
@@ -220,7 +210,7 @@ impl Transaction {
     /// * `key_name` - the name of the key to be looked up in the database
     ///
     /// TODO: implement: snapshot Non-zero if this is a snapshot read.
-    pub fn get<'a>(&self, key: &[u8], snapshot: bool) -> impl Future<Output=Result<Option<FutCell<'a, &'a [u8]>>>> {
+    pub fn get<'a>(&self, key: &[u8], snapshot: bool) -> impl WaitFuture<Result<Option<FutCell<'a, &'a [u8]>>>> {
         let trx = self.inner.inner;
 
         unsafe {
@@ -529,12 +519,12 @@ impl Transaction {
     /// As with other client/server databases, in some failure scenarios a client may be unable to determine whether a transaction succeeded. In these cases, `Transaction::commit` will return a commit_unknown_result error. The fdb_transaction_on_error() function treats this error as retryable, so retry loops that don’t check for commit_unknown_result could execute the transaction twice. In these cases, you must consider the idempotence of the transaction. For more information, see Transactions with unknown results.
     ///
     /// Normally, commit will wait for outstanding reads to return. However, if those reads were snapshot reads or the transaction option for disabling “read-your-writes” has been invoked, any outstanding reads will immediately return errors.
-    pub fn commit(&self) -> impl std::future::Future<Output=Result<()>> {
+    pub fn commit(&self) -> impl Future<Output=Result<()>> + Wait<Result<()>> {
         let trx = self.inner.inner;
 
         unsafe {
             let f = fdb::fdb_transaction_commit(trx);
-            FdbFuture3::new(f).map_ok(|_r| ())
+            FdbFuture3::new_void(f)
         }
     }
 
@@ -585,7 +575,7 @@ impl Transaction {
     /// The API is exposed mainly for `bindingtester`, and it is not recommended to call the API
     /// directly from application. Use `Database::transact` instead.
     #[doc(hidden)]
-    pub fn on_error(&self, error: &Error) -> Option<impl std::future::Future<Output=Result<()>>> {
+    pub fn on_error(&self, error: &Error) -> Option<impl Future<Output=Result<()>>> {
         if let Some(code) = error.code() {
             unsafe {
                 let f = fdb::fdb_transaction_on_error(self.inner.inner, code.get() as i32);

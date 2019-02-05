@@ -13,107 +13,100 @@ extern crate foundationdb;
 extern crate lazy_static;
 
 use std::future::*;
+use foundationdb::future::Wait;
 
 use foundationdb::*;
-//use futures::future::*;
+use futures::*;
 use futures::executor::*;
 
 mod common;
 
 #[test]
-fn test_set_get() {
+fn test_set_get() -> Result<(), Error> {
     common::setup_static();
+    let cluster = Cluster::new(foundationdb::default_config_path()).wait()?;
+    let db = cluster.create_database().wait()?;
 
-    block_on(async {
-        let cluster = await!(Cluster::new(foundationdb::default_config_path())).unwrap();
-        let db = await!(cluster.create_database()).unwrap();
+    block_on(async || -> Result<(), Error> {
 
         await!(db.transact(async move |tr| {
             tr.set(b"hello", b"world");
             Ok(())
-        })).unwrap();
+        }))?;
 
-        let result = await!(db.transact(async move |tr| {
-            await!(tr.get(b"hello", false))
-        })).unwrap();
+        let result = await!(db.transact(|tr| tr.get(b"hello", false)))?;
 
         assert_eq!(*result.unwrap(), b"world");
 
         await!(db.transact(async move |tr| {
             tr.clear(b"hello");
             Ok(())
-        })).unwrap();
+        }))?;
 
-        let result = await!(db.transact(async move |tr| {
-            await!(tr.get(b"hello", false))
-        })).unwrap();
+        let result = await!(db.transact(|tr| {
+            tr.get(b"hello", false)
+        }))?;
 
         assert!(result.is_none());
-    });
+        Ok(())
+    }())?;
+
+    Ok(())
 }
 
-//#[test]
-//fn test_get_multi() {
-//    common::setup_static();
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| result(db.create_trx()))
-//        .and_then(|trx| {
-//            let keys: &[&[u8]] = &[b"hello", b"world", b"foo", b"bar"];
-//
-//            let futs = keys.iter().map(|k| trx.get(k, false)).collect::<Vec<_>>();
-//            join_all(futs)
-//        })
-//        .and_then(|results| {
-//            for (i, res) in results.into_iter().enumerate() {
-//                eprintln!("res[{}]: {:?}", i, res.value());
-//            }
+#[test]
+fn test_get_multi() -> Result<(), Error> {
+    common::setup_static();
+    let cluster = Cluster::new(foundationdb::default_config_path()).wait()?;
+    let db = cluster.create_database().wait()?;
+
+    block_on(async || -> Result<(), Error> {
+//        await!(db.transact(async move |tr| {
+//            tr.set(b"hello", b"world");
+//            tr.set(b"bar", b"blat");
 //            Ok(())
-//        });
-//
-//    fut.wait().expect("failed to run")
-//}
-//
-//#[test]
-//fn test_set_conflict() {
-//    common::setup_static();
-//
-//    let key = b"test-conflict";
-//    let fut = Cluster::new(foundationdb::default_config_path())
-//        .and_then(|cluster| cluster.create_database())
-//        .and_then(|db| {
-//            // First transaction. It will be committed before second one.
-//            let fut_set1 = result(db.create_trx()).and_then(|trx1| {
-//                trx1.set(key, common::random_str(10).as_bytes());
-//                trx1.commit()
-//            });
-//
-//            // Second transaction. There will be conflicted by first transaction before commit.
-//            result(db.create_trx())
-//                .and_then(|trx2| {
-//                    // try to read value to set conflict range
-//                    trx2.get(key, false)
-//                })
-//                .and_then(move |val| {
-//                    // commit first transaction to create conflict
-//                    fut_set1.map(move |_trx1| val.transaction())
-//                })
-//                .and_then(|trx2| {
-//                    // commit seconds transaction, which will cause conflict
-//                    trx2.set(key, common::random_str(10).as_bytes());
-//                    trx2.commit()
-//                })
-//                .map(|_v| {
-//                    panic!("should not be committed without conflict");
-//                })
-//                .or_else(|e| {
-//                    eprintln!("error as expected: {:?}", e);
-//                    Ok(())
-//                })
-//        });
-//
-//    fut.wait().expect("failed to run")
-//}
+//        }))?;
+
+        let keys:&[&[u8]] = &[b"hello", b"world", b"foo", b"bar"];
+        let result = await!(db.transact(async move |tr| {
+            let r1 = await!(futures::future::join_all(keys.iter().map(|k| tr.get(k, false))));
+            r1.into_iter().collect::<Result<Vec<_>, _>>()
+        }))?;
+
+        eprintln!("res {:?}", result);
+
+        Ok(())
+    }())
+}
+
+#[test]
+fn test_set_conflict() -> Result<(), Error> {
+    common::setup_static();
+    let cluster = Cluster::new(foundationdb::default_config_path()).wait()?;
+    let db = cluster.create_database().wait()?;
+
+    let key = b"test-conflict";
+
+    block_on(async || -> Result<(), Error> {
+        let trx2 = db.create_trx()?;
+        await!(trx2.get(key, false))?;
+
+        // Commit concurrent transaction to create conflict.
+        await!(db.transact(async move |trx1| {
+            trx1.set(key, common::random_str(10).as_bytes());
+            Ok(())
+        }))?;
+
+        trx2.set(key, common::random_str(10).as_bytes());
+        let r = await!(trx2.commit());
+
+//        println!("{:?}", r);
+        // 1020 == "Transaction not committed due to conflict with another transaction"
+        assert_eq!(r.err().expect("Transaction should have conflicted").code().unwrap().get(), 1020);
+        Ok(())
+    }())
+}
+
 //
 //#[test]
 //fn test_set_conflict_snapshot() {

@@ -52,7 +52,7 @@ impl Database {
                 self.inner.inner,
                 &mut trx as *mut _,
             ))?;
-            Ok(Transaction::new(self.clone(), trx))
+            Ok(Transaction::new(trx))
         }
     }
 

@@ -31,7 +31,7 @@ impl Cluster {
     /// * `path` - A string giving a local path of a cluster file (often called ‘fdb.cluster’) which contains connection information for the FoundationDB cluster. See `foundationdb::default_config_path()`
     ///
     /// TODO: implement Default for Cluster where: If cluster_file_path is NULL or an empty string, then a default cluster file will be used. see
-    pub fn new(path: &str) -> impl Future<Output=Result<Cluster>> {
+    pub fn new(path: &str) -> impl WaitFuture<Result<Cluster>> {
         let path_str = std::ffi::CString::new(path).unwrap();
         unsafe {
             let f = fdb::fdb_create_cluster(path_str.as_ptr());
@@ -46,7 +46,7 @@ impl Cluster {
     /// Returns an `FdbFuture` which will be set to an `Database` object.
     ///
     /// TODO: impl Future
-    pub fn create_database(&self) -> impl Future<Output=Result<Database>> {
+    pub fn create_database(&self) -> impl WaitFuture<Result<Database>> {
         unsafe {
             let f_db = fdb::fdb_cluster_create_database((self.0).0, b"DB" as *const _, 2);
             let cluster = self.clone();

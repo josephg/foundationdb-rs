@@ -7,43 +7,73 @@ use futures::prelude::*;
 use futures::future::FusedFuture;
 use futures::task::{AtomicWaker, LocalWaker, Poll};
 
+pub use crate::andthenfut::*;
 use crate::error::{self, Error, Result};
 use foundationdb_sys as fdb;
-pub use crate::andthenfut::*;
+
+pub trait WaitFuture<T> = Future<Output=T> + Wait<T>;
+
+/// A semi-safe wrapper for a foundationdb future object which is guaranteed to be valid (not destroyed).
+struct FdbFutureInternal(NonNull<fdb::FDBFuture>);
+
+impl FdbFutureInternal {
+    fn new(ptr: *mut fdb::FDBFuture) -> Self {
+        Self(NonNull::new(ptr).expect("future is null"))
+    }
+
+    fn as_mut_ptr(&self) -> *mut fdb::FDBFuture { self.0.as_ptr() }
+}
+
+impl Drop for FdbFutureInternal {
+    fn drop(&mut self) {
+        unsafe { fdb::fdb_future_destroy(self.0.as_ptr()) }
+    }
+}
 
 
+/// A wrapped future which is guaranteed to be:
+///
+/// - Ready
+/// - Not in an error state
+/// - Valid (ie, not yet destroyed)
+pub(crate) struct FdbFutureResult(FdbFutureInternal);
+
+
+
+fn result_ok(_result: FdbFutureResult) -> Result<()> { Ok(()) }
 
 /// An opaque type that represents a Future in the FoundationDB C API.
 pub(crate) struct FdbFuture3 {
-    f: Option<NonNull<fdb::FDBFuture>>, // Set to None once the result has been returned
+    f: Option<FdbFutureInternal>, // Set to None once the result has been returned
 
     // We need an AtomicWaker because FDB may resolve the promise in the context of the network thread.
     waker: AtomicWaker,
 }
 
+
 impl FdbFuture3 {
     pub(crate) unsafe fn new(fdb_fut: *mut fdb::FDBFuture) -> Self {
         FdbFuture3 {
-            f: Some(NonNull::new(fdb_fut).expect("future is null")),
+            f: Some(FdbFutureInternal::new(fdb_fut)),
             waker: AtomicWaker::new(),
         }
     }
 
-    pub(crate) unsafe fn new_mapped<T, F>(fdb_fut: *mut fdb::FDBFuture, f: F) -> impl Future<Output=Result<T>>
-        where F: FnOnce(FdbFutureResult) -> Result<T> {
+    pub(crate) unsafe fn new_mapped<F, R>(fdb_fut: *mut fdb::FDBFuture, f: F) -> impl Future<Output=Result<R>> + Wait<Result<R>>
+            where F: FnOnce(FdbFutureResult) -> Result<R> {
         FdbFuture3::new(fdb_fut).and_map(f)
     }
 
-    pub(crate) unsafe fn new_void(fdb_fut: *mut fdb::FDBFuture) -> impl Future<Output=Result<()>> {
-        FdbFuture3::new(fdb_fut).map_ok(|_r| ())
+    pub(crate) unsafe fn new_void(fdb_fut: *mut fdb::FDBFuture) -> impl Future<Output=Result<()>> + Wait<Result<()>> {
+        FdbFuture3::new_mapped(fdb_fut, result_ok)
     }
 }
 
-impl Drop for FdbFuture3 {
-    fn drop(&mut self) {
-        if let Some(f) = self.f {
-            unsafe { fdb::fdb_future_destroy(f.as_ptr()) }
-        }
+impl Wait<Result<FdbFutureResult>> for FdbFuture3 {
+    fn wait(mut self) -> Result<FdbFutureResult> {
+        let f = self.f.take().expect("Cannot wait on polled FDB future");
+        error::eval(unsafe { fdb::fdb_future_block_until_ready(f.as_mut_ptr()) })?;
+        unsafe { FdbFutureResult::from_ready(f) }
     }
 }
 
@@ -51,15 +81,13 @@ impl FusedFuture for FdbFuture3 {
     fn is_terminated(&self) -> bool { self.f.is_some() }
 }
 
-impl TryFuture for FdbFuture3 {
-    type Ok = FdbFutureResult;
-    type Error = Error;
+impl Future for FdbFuture3 {
+    type Output = Result<FdbFutureResult>;
 
-    fn try_poll(self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Result<Self::Ok>> {
-        let f = self.f.expect("cannot poll after resolve");
-        let f_ptr = f.as_ptr();
+    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Self::Output> {
+        let f_ptr = self.f.as_ref().expect("cannot poll after resolve").as_mut_ptr();
 
-        if unsafe {fdb::fdb_future_is_ready(f_ptr)} == 0 {
+        if unsafe { fdb::fdb_future_is_ready(f_ptr) } == 0 {
             self.waker.register(lw);
             unsafe {
                 let waker: *mut _ = &mut self.get_unchecked_mut().waker;
@@ -69,11 +97,8 @@ impl TryFuture for FdbFuture3 {
         }
 
         // Alright; the promise *is* ready. Resolve.
-        self.get_mut().f = None;
-
-        let err_code = unsafe { fdb::fdb_future_get_error(f_ptr) };
-        if err_code != 0 { Poll::Ready(Err(Error::from(err_code))) }
-        else { Poll::Ready(Ok(FdbFutureResult(f))) }
+        // Take out the future
+        unsafe { Poll::Ready(FdbFutureResult::from_ready(self.get_mut().f.take().unwrap())) }
     }
 }
 
@@ -86,18 +111,6 @@ extern "C" fn fdb_future_callback(
 }
 
 
-/// A wrapped future which is guaranteed to be:
-///
-/// - Ready
-/// - Not in an error state
-/// - Valid (ie, not yet destroyed)
-pub(crate) struct FdbFutureResult(NonNull<fdb::FDBFuture>);
-
-impl Drop for FdbFutureResult {
-    fn drop(&mut self) {
-        unsafe { fdb::fdb_future_destroy(self.0.as_ptr()) }
-    }
-}
 
 /// For output which is owned by the future (eg strings), we could either copy it into a Box or something, or keep it allocated alongside the future reference. Done this way avoids an allocation.
 pub struct FutCell<'a, T: 'a> {
@@ -178,6 +191,13 @@ impl<'a> KeyValue<'a> {
 }
 
 impl FdbFutureResult {
+    unsafe fn from_ready(fut: FdbFutureInternal) -> Result<Self> {
+        // the future must be ready (unchecked)
+        error::eval(unsafe { fdb::fdb_future_get_error(fut.as_mut_ptr()) })?;
+
+        Ok(FdbFutureResult(fut))
+    }
+
     fn into_scoped<'a, T: 'a>(self, value: T) -> FutCell<'a, T> {
         FutCell {
             _fut: self,
@@ -188,13 +208,13 @@ impl FdbFutureResult {
 
     pub(crate) unsafe fn get_cluster(&self) -> Result<*mut fdb::FDBCluster> {
         let mut v: *mut fdb::FDBCluster = std::ptr::null_mut();
-        error::eval(fdb::fdb_future_get_cluster(self.0.as_ptr(), &mut v as *mut _))?;
+        error::eval(fdb::fdb_future_get_cluster(self.0.as_mut_ptr(), &mut v as *mut _))?;
         Ok(v)
     }
 
     pub(crate) unsafe fn get_database(&self) -> Result<*mut fdb::FDBDatabase> {
         let mut v: *mut fdb::FDBDatabase = std::ptr::null_mut();
-        error::eval(fdb::fdb_future_get_database(self.0.as_ptr(), &mut v as *mut _))?;
+        error::eval(fdb::fdb_future_get_database(self.0.as_mut_ptr(), &mut v as *mut _))?;
         Ok(v)
     }
 
@@ -205,7 +225,7 @@ impl FdbFutureResult {
 
         unsafe {
             error::eval(fdb::fdb_future_get_value(
-                self.0.as_ptr(),
+                self.0.as_mut_ptr(),
                 &mut present as *mut _,
                 &mut out_value as *mut _,
                 &mut out_len as *mut _,
@@ -230,7 +250,7 @@ impl FdbFutureResult {
 
         unsafe {
             error::eval(fdb::fdb_future_get_key(
-                self.0.as_ptr(),
+                self.0.as_mut_ptr(),
                 &mut out_value as *mut _,
                 &mut out_len as *mut _,
             ))?
@@ -251,7 +271,7 @@ impl FdbFutureResult {
 
         unsafe {
             error::eval(fdb::fdb_future_get_string_array(
-                self.0.as_ptr(),
+                self.0.as_mut_ptr(),
                 &mut out_strings as *mut _,
                 &mut out_len as *mut _,
             ))?
@@ -276,7 +296,7 @@ impl FdbFutureResult {
 
         unsafe {
             error::eval(fdb::fdb_future_get_keyvalue_array(
-                self.0.as_ptr(),
+                self.0.as_mut_ptr(),
                 &mut out_keyvalues as *mut _,
                 &mut out_len as *mut _,
                 &mut more as *mut _,
@@ -296,7 +316,7 @@ impl FdbFutureResult {
     pub(crate) fn get_version(&self) -> Result<i64> {
         let mut version: i64 = 0;
         unsafe {
-            error::eval(fdb::fdb_future_get_version(self.0.as_ptr(), &mut version as *mut _))?;
+            error::eval(fdb::fdb_future_get_version(self.0.as_mut_ptr(), &mut version as *mut _))?;
         }
         Ok(version)
     }
